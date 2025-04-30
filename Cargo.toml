@@ -1,0 +1,15 @@
+[package]
+name = "watchme"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libmdbx = { version = "0.5.4", default-features = false }
+# High-level safe wrapper (pulls in capstone-sys automatically)
+capstone = "0.13.0"
+anyhow = "1.0.98"
+# capstone = { version = "0.13.0", default-features = false, features = [
+#     "full",        # build the complete Capstone C core (keeps every arch)
+#     "static"       # link the C core statically into your binary (optional)
+#     # "use_system_capstone"    # ⇢ link against a system-installed libcapstone
+# ] }
