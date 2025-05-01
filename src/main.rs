@@ -1,127 +1,87 @@
-
-// capstone_llil_example.rs — minimal demo (compiles on Rust 1.78 + capstone 0.13.0)
-// Disassembles a tiny AArch64 snippet with Capstone and lifts it into a
-// hand‑rolled Binary‑Ninja‑style Low‑Level IL (LLIL).
-//
-// Build:
-//   cargo new demo && cd demo
-//   echo 'capstone = "0.13"' >> Cargo.toml
-//   paste this file into src/main.rs
-//   cargo run --release
-
-use capstone::arch::arm64::{self, Arm64Insn, Arm64OperandType, ArchMode};
+use std::{env, error::Error, fs::File, path::Path};
+use memmap2::Mmap;
+use goblin::elf::{program_header::PF_X, Elf};
 use capstone::prelude::*;
-use capstone::RegId;
-use std::error::Error;
-use capstone::Insn;
-use capstone::arch::arm64::Arm64Operand;
+use goblin::elf::section_header::SHF_EXECINSTR;
 
-/// Value width in bytes (BN LLIL tracks sizes explicitly)
-pub type Size = u8;
+mod llil;                // <-- your Expr/Instr/translate_arm64 lives here
 
-/// Minimal register set for the demo
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum Reg {
-    X(u8),
-    SP,
-    LR,
-    ZR,
-}
-
-/// Tiny expression tree (subset of BN LLIL)
-#[derive(Clone, Debug)]
-pub enum Expr {
-    Const(Size, u64),
-    Reg(Size, Reg),
-}
-
-/// Basic‑block label wrapper for type‑safety
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct Label(pub usize);
-
-/// IL instructions we actually emit in this demo
-#[derive(Clone, Debug)]
-pub enum Instr {
-    SetReg(Reg, Expr),
-    Ret,
-    Unimpl,
-}
-
-// ─────────────────────────────────────────────────────────────
-// Fresh‑label generator (thread‑local counter is fine for a demo)
-// ─────────────────────────────────────────────────────────────
-thread_local! {
-    static LABEL_COUNTER: std::cell::Cell<usize> = std::cell::Cell::new(0);
-}
-fn _fresh_label() -> Label { // not used yet, but kept for future CF work
-    LABEL_COUNTER.with(|c| { let id = c.get(); c.set(id + 1); Label(id) })
-}
-
-// ─────────────────────────────────────────────────────────────
-// Capstone → LLIL translator (MOV‑imm & RET only, for brevity)
-// ─────────────────────────────────────────────────────────────
-fn translate_arm64(cs: &Capstone, insn: &Insn) -> Result<Instr, Box<dyn Error>> {
-    match insn.id().0 {
-        id if id == Arm64Insn::ARM64_INS_MOV as u32 => {
-            let detail = cs.insn_detail(insn)?;
-            let det = detail.arch_detail();
-            let arch_detail = det.arm64().ok_or("Not AArch64")?;
-            let ops: Vec<Arm64Operand> = arch_detail.operands().collect();
-            // Destination register is always first operand
-            // dst register
-            // println!("{:?}", ops);
-            // [Arm64Operand { vector_index: None, vas: ARM64_VAS_INVALID, shift: Invalid, ext: ARM64_EXT_INVALID, op_type: Reg(RegId(216)) }, Arm64Operand { vector_index: None, vas: ARM64_VAS_INVALID, shift: Invalid, ext: ARM64_EXT_INVALID, op_type: Imm(1) }]
-            let dst_reg = match ops[0].op_type {
-                Arm64OperandType::Reg(rid) => reg_from_cs(rid),
-                _ => Reg::ZR,
-            };
-            // immediate value
-            let imm_val = match ops[1].op_type {
-                Arm64OperandType::Imm(val) => val as u64,
-                _ => 0,
-            };
-            Ok(Instr::SetReg(dst_reg, Expr::Const(8, imm_val)))
-            //Ok(Instr::Unimpl)
-        }
-        id if id == Arm64Insn::ARM64_INS_RET as u32 => Ok(Instr::Ret),
-        _ => Ok(Instr::Unimpl),
-    }
-}
-
-/// Convert Capstone register id ➜ our tiny `Reg` enum
-fn reg_from_cs(rid: RegId) -> Reg {
-    let raw = rid.0 as u32;
-    match raw {
-        id if id >= arm64::Arm64Reg::ARM64_REG_X0 as u32 && id <= arm64::Arm64Reg::ARM64_REG_X28 as u32 => {
-            Reg::X((id - arm64::Arm64Reg::ARM64_REG_X0 as u32) as u8)
-        }
-        id if id == arm64::Arm64Reg::ARM64_REG_SP as u32 => Reg::SP,
-        id if id == arm64::Arm64Reg::ARM64_REG_LR as u32 => Reg::LR,
-        _ => Reg::ZR,
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
-// Demo driver: disassemble + translate + print IL
-// ─────────────────────────────────────────────────────────────
 fn main() -> Result<(), Box<dyn Error>> {
-    // Machine code: `mov x0, #1 ; ret`
-    const CODE: &[u8] = b"\x20\x00\x80\xd2\xc0\x03\x5f\xd6";
+    // ------- 1. open + mmap ----------
+    let path = env::args().nth(1).expect("give .so path");
+    let file = File::open(&path)?;
+    let map  = unsafe { Mmap::map(&file)? };        // readonly mmap :contentReference[oaicite:5]{index=5}
 
-    // Capstone disassembler setup
+    // ------- 2. parse ELF header ------
+    let elf = Elf::parse(&map)?;                    // zero-copy :contentReference[oaicite:6]{index=6}
+
+    // ------- 3. set up Capstone -------
     let cs = Capstone::new()
-        .arm64()
-        .mode(ArchMode::Arm) // 64‑bit AArch64 mode
-        .detail(true)        // request operand details
+        .arm64()                                   // or .x86(), etc.
+        .mode(arch::arm64::ArchMode::Arm)
+        .detail(true)
         .build()?;
 
-    let insns = cs.disasm_all(CODE, 0x1000)?;
+    // ------- 4. iterate executable segments ----
+    for ph in elf.program_headers.iter().filter(|ph| ph.is_executable()) {
+        let range = ph.file_range();              // Range<usize>
+        if range.is_empty() { continue; }
 
-    // Translate each instruction to IL and print
-    for insn in insns.as_ref() {
-        let il = translate_arm64(&cs, insn)?;
-        println!("{:#x}: {:?}", insn.address(), il);
+        let bytes = &map[range.clone()];          // slice straight from mmap
+        let vaddr = ph.p_vaddr;
+
+        println!(
+            "\nSEGMENT @ file 0x{:x} (size 0x{:x}) → vaddr 0x{:x}",
+            range.start, range.len(), vaddr
+        );
+
+        // 4.a  hex-dump first ≤32 bytes
+        let dump_len = bytes.len().min(32);
+        print!("  first {dump_len} bytes: ");
+        for b in &bytes[..dump_len] { print!("{b:02x} "); }
+        println!();
+
+        // 4.b  decode instructions one-by-one
+        let mut cur_off  = 0;
+        let mut cur_addr = vaddr;
+
+        while cur_off < bytes.len() {
+            let insns = cs.disasm_count(&bytes[cur_off..], cur_addr, 1)?;
+            if insns.is_empty() {
+                //println!("  {cur_addr:08x}: <undecodable>");
+                // break;
+                cur_off  += 4;
+                cur_addr += 4 as u64;
+                continue;
+            }
+
+            let insn = insns.get(0).unwrap();
+            let size = insn.bytes().len();
+            let il   = llil::translate_arm64(&cs, insn)?;
+
+            println!(
+                "  {:#010x}: {:<12} {:<24} {:?}",
+                insn.address(),
+                insn.mnemonic().unwrap_or(""),
+                insn.op_str().unwrap_or(""),
+                il
+            );
+
+            cur_off  += size;
+            cur_addr += size as u64;
+        }
     }
     Ok(())
 }
 
+// ----- convenience extension traits -----
+trait PhExt {
+    fn is_executable(&self) -> bool;
+    fn file_range(&self) -> Option<(u64,u64)>;
+}
+impl PhExt for goblin::elf::ProgramHeader {
+    fn is_executable(&self) -> bool { self.p_flags & PF_X != 0 }
+    fn file_range(&self) -> Option<(u64,u64)> {
+        if self.p_filesz == 0 { None } else { Some((self.p_offset, self.p_filesz)) }
+    }
+}

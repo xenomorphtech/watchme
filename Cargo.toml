@@ -8,6 +8,8 @@ libmdbx = { version = "0.5.4", default-features = false }
 # High-level safe wrapper (pulls in capstone-sys automatically)
 capstone = "0.13.0"
 anyhow = "1.0.98"
+memmap2   = "0.9"       # mmap the file
+goblin = "0.9.3"       # zero-copy ELF parser
 # capstone = { version = "0.13.0", default-features = false, features = [
 #     "full",        # build the complete Capstone C core (keeps every arch)
 #     "static"       # link the C core statically into your binary (optional)
